@@ -1,4 +1,4 @@
-# WhatsRustTracker 🚀
+# RustWatch 🚀
 
 A robust, Rust-based website monitoring daemon that sends instant alerts via **WhatsApp** and **Telegram**. Features an interactive CLI and full remote control via WhatsApp.
 
