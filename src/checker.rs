@@ -22,19 +22,19 @@ pub async fn check_site(client: &Client, url: &str, timeout: u64) -> (bool, Stri
             (success, status)
         }
         Err(e) => {
-            let status = if e.is_timeout() {
-                "Timeout".to_string()
+            let (short_status, full_status) = if e.is_timeout() {
+                ("Timeout", format!("Timeout: {}", e))
             } else if e.is_builder() {
-                "Builder Error".to_string()
+                ("Builder Error", format!("Builder Error: {}", e))
             } else if e.is_request() {
-                "Request Error".to_string()
+                ("Request Error", format!("Request Error: {}", e))
             } else if e.is_connect() {
-                "Connection Error".to_string()
+                ("Connection Error", format!("Connection Error: {}", e))
             } else {
-                format!("Error: {}", e)
+                ("Error", format!("Error: {}", e))
             };
-            println!("❌  [{}] failed: {}", final_url, status);
-            (false, status)
+            println!("❌  [{}] failed: {}", final_url, full_status);
+            (false, short_status.to_string())
         }
     }
 }
