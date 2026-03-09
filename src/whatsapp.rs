@@ -44,6 +44,10 @@ impl WhatsAppNotifier {
     pub async fn new(recipients: Vec<String>, state: Arc<RwLock<AppState>>, notify: Arc<Notify>) -> Result<Self> {
         let backend = Arc::new(SqliteStore::new("whatsapp.db").await?);
         let recipients_for_event = recipients.clone();
+        let ready_notify = Arc::new(Notify::new());
+        let ready_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ready_flag_clone = ready_flag.clone();
+        let ready_notify_clone = ready_notify.clone();
 
         let mut bot = Bot::builder()
             .with_backend(backend)
@@ -54,13 +58,23 @@ impl WhatsAppNotifier {
                 let notify = notify.clone();
                 let recipients = recipients_for_event.clone();
                 let client = client.clone();
+                let ready_flag_inner = ready_flag_clone.clone();
+                let ready_notify_inner = ready_notify_clone.clone();
                 async move {
                     match event {
                         Event::PairingQrCode { code, .. } => {
                             let _ = qr2term::print_qr(&code);
                             println!("Raw QR: {}", code);
                         }
-                        Event::PairSuccess(_) => println!("WhatsApp paired successfully!"),
+                        Event::PairSuccess(_) => {
+                            println!("WhatsApp paired successfully!");
+                        }
+                        Event::Connected(_) | Event::OfflineSyncCompleted(_) => {
+                            if !ready_flag_inner.load(std::sync::atomic::Ordering::Relaxed) {
+                                ready_flag_inner.store(true, std::sync::atomic::Ordering::Relaxed);
+                                ready_notify_inner.notify_one();
+                            }
+                        }
                         Event::Message(message, info) => {
                             let sender_full = info.source.sender.to_string();
                             let mut text_content: Option<String> = None;
@@ -237,7 +251,20 @@ impl WhatsAppNotifier {
             .await?;
 
         let client = bot.client();
-        tokio::spawn(async move { let _ = bot.run().await; });
+        
+        let run_handle = bot.run().await?;
+        tokio::spawn(async move { let _ = run_handle.await; });
+        
+        println!("Waiting for WhatsApp device sync to complete...");
+        tokio::select! {
+            _ = ready_notify.notified() => {
+                println!("WhatsApp device sync complete!");
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                println!("Warning: Sync timeout, proceeding anyway...");
+            }
+        }
+        
         Ok(Self { client, recipients })
     }
 }
