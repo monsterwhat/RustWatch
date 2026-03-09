@@ -16,6 +16,7 @@ pub struct NotifierManager {
     last_whatsapp_config: Option<WhatsAppConfig>,
     state: Arc<RwLock<AppState>>,
     notify: Arc<Notify>,
+    whatsapp_started: bool,
 }
 
 impl NotifierManager {
@@ -28,6 +29,7 @@ impl NotifierManager {
             last_whatsapp_config: None,
             state,
             notify,
+            whatsapp_started: false,
         }
     }
 
@@ -63,20 +65,13 @@ impl NotifierManager {
         // WhatsApp
         if state.whatsapp.enabled {
             if !state.whatsapp.recipients.is_empty() {
-                let current_config = state.whatsapp.clone();
-                if self.whatsapp_notifier.is_none() || self.last_whatsapp_config.as_ref() != Some(&current_config) {
+                // Only create once - don't recreate on every tick
+                if self.whatsapp_notifier.is_none() {
                     println!("Initializing WhatsApp notifier for {} recipients...", state.whatsapp.recipients.len());
                     match WhatsAppNotifier::new(state.whatsapp.recipients.clone(), self.state.clone(), self.notify.clone()).await {
                         Ok(w) => {
-                            let name = {
-                                let lock = self.state.read().unwrap();
-                                lock.name.clone()
-                            };
-                            println!("WhatsApp notifier initialized.");
-                            let _ = w.send(&format!("✅ {} successfully configured! (Remote commands active)", name), None).await;
-                            
                             self.whatsapp_notifier = Some(Arc::new(w));
-                            self.last_whatsapp_config = Some(current_config);
+                            self.last_whatsapp_config = Some(state.whatsapp.clone());
                         }
                         Err(e) => {
                             println!("❌ Failed to initialize WhatsApp: {}", e);
@@ -84,8 +79,21 @@ impl NotifierManager {
                         }
                     }
                 }
+                
+                // Add to list only if connected, and send startup message once
                 if let Some(ref n) = self.whatsapp_notifier {
-                    list.push(n.clone());
+                    if n.is_connected() {
+                        if !self.whatsapp_started {
+                            let name = {
+                                let lock = self.state.read().unwrap();
+                                lock.name.clone()
+                            };
+                            println!("WhatsApp notifier initialized.");
+                            let _ = n.send_startup_message(&name).await;
+                            self.whatsapp_started = true;
+                        }
+                        list.push(n.clone());
+                    }
                 }
             }
         } else {

@@ -5,6 +5,7 @@ use crate::stats;
 use async_trait::async_trait;
 use anyhow::Result;
 use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::Notify;
 use chrono::{Utc, Duration};
 
@@ -20,6 +21,43 @@ use wacore::types::events::Event;
 pub struct WhatsAppNotifier {
     client: Arc<Client>,
     recipients: Vec<String>,
+    connected: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl WhatsAppNotifier {
+    pub fn is_connected(&self) -> bool {
+        self.connected.load(Ordering::SeqCst)
+    }
+    
+    pub async fn wait_for_ready(&self) -> Result<()> {
+        if self.connected.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        
+        // Wait up to 10 seconds for connection
+        for _ in 0..20 {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            if self.connected.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+        }
+        Err(anyhow::anyhow!("WhatsApp not ready"))
+    }
+    
+    pub async fn send_startup_message(&self, name: &str) -> Result<()> {
+        if !self.connected.load(Ordering::SeqCst) {
+            return Err(anyhow::anyhow!("WhatsApp not connected"));
+        }
+        
+        // Wait a moment for any pending sync
+        tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+        
+        for recipient in &self.recipients {
+            let jid: Jid = format!("{}@s.whatsapp.net", recipient).parse()?;
+            send_robust(self.client.clone(), jid, format!("✅ {} successfully configured! (Remote commands active)", name)).await?;
+        }
+        Ok(())
+    }
 }
 
 async fn send_robust(client: Arc<Client>, jid: Jid, text: String) -> Result<()> {
@@ -45,9 +83,11 @@ impl WhatsAppNotifier {
         let backend = Arc::new(SqliteStore::new("whatsapp.db").await?);
         let recipients_for_event = recipients.clone();
         let ready_notify = Arc::new(Notify::new());
-        let ready_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ready_flag = Arc::new(AtomicBool::new(false));
         let ready_flag_clone = ready_flag.clone();
         let ready_notify_clone = ready_notify.clone();
+        let connected = Arc::new(AtomicBool::new(false));
+        let connected_for_event = connected.clone();
 
         let mut bot = Bot::builder()
             .with_backend(backend)
@@ -60,6 +100,7 @@ impl WhatsAppNotifier {
                 let client = client.clone();
                 let ready_flag_inner = ready_flag_clone.clone();
                 let ready_notify_inner = ready_notify_clone.clone();
+                let connected_inner = connected_for_event.clone();
                 async move {
                     match event {
                         Event::PairingQrCode { code, .. } => {
@@ -69,11 +110,35 @@ impl WhatsAppNotifier {
                         Event::PairSuccess(_) => {
                             println!("WhatsApp paired successfully!");
                         }
-                        Event::Connected(_) | Event::OfflineSyncCompleted(_) => {
-                            if !ready_flag_inner.load(std::sync::atomic::Ordering::Relaxed) {
-                                ready_flag_inner.store(true, std::sync::atomic::Ordering::Relaxed);
+                        Event::Connected(_) => {
+                            println!("🔄 WhatsApp reconnecting, waiting for sync...");
+                            ready_flag_inner.store(false, Ordering::Relaxed);
+                        }
+                        Event::OfflineSyncCompleted(_) => {
+                            if !ready_flag_inner.load(Ordering::Relaxed) {
+                                ready_flag_inner.store(true, Ordering::Relaxed);
                                 ready_notify_inner.notify_one();
                             }
+                            connected_inner.store(true, Ordering::SeqCst);
+                            println!("✓ WhatsApp connected and ready");
+                        }
+                        Event::DeviceListUpdate(_) => {
+                            println!("📱 Device list updated - re-syncing keys...");
+                            ready_flag_inner.store(false, Ordering::Relaxed);
+                            connected_inner.store(false, Ordering::SeqCst);
+                        }
+                        Event::Disconnected(_) => {
+                            println!("⚠️ WhatsApp disconnected!");
+                            connected_inner.store(false, Ordering::SeqCst);
+                            ready_flag_inner.store(false, Ordering::Relaxed);
+                        }
+                        Event::LoggedOut(_) => {
+                            println!("🔴 WhatsApp session logged out! Please re-authenticate.");
+                            ready_flag_inner.store(false, Ordering::Relaxed);
+                        }
+                        Event::StreamReplaced(_) => {
+                            println!("⚠️ WhatsApp session replaced (another device logged in)");
+                            ready_flag_inner.store(false, Ordering::Relaxed);
                         }
                         Event::Message(message, info) => {
                             let sender_full = info.source.sender.to_string();
@@ -251,6 +316,27 @@ impl WhatsAppNotifier {
             .await?;
 
         let client = bot.client();
+        let connected = Arc::new(AtomicBool::new(false));
+        let connected_for_reconnect = connected.clone();
+        let ready_flag_for_reconnect = ready_flag.clone();
+        
+        // Spawn background task to handle reconnection waits
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                if !connected_for_reconnect.load(Ordering::SeqCst) {
+                    // Disconnected, wait for reconnect
+                    println!("⏳ Waiting for WhatsApp reconnection...");
+                    loop {
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        if ready_flag_for_reconnect.load(Ordering::Relaxed) {
+                            println!("✓ WhatsApp reconnected and synced!");
+                            break;
+                        }
+                    }
+                }
+            }
+        });
         
         let run_handle = bot.run().await?;
         tokio::spawn(async move { let _ = run_handle.await; });
@@ -259,19 +345,24 @@ impl WhatsAppNotifier {
         tokio::select! {
             _ = ready_notify.notified() => {
                 println!("WhatsApp device sync complete!");
+                connected.store(true, Ordering::SeqCst);
             }
             _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
                 println!("Warning: Sync timeout, proceeding anyway...");
             }
         }
         
-        Ok(Self { client, recipients })
+        Ok(Self { client, recipients, connected })
     }
 }
 
 #[async_trait]
 impl Notifier for WhatsAppNotifier {
     async fn send(&self, message: &str, target_recipients: Option<&[String]>) -> Result<()> {
+        if !self.connected.load(Ordering::SeqCst) {
+            return Err(anyhow::anyhow!("WhatsApp not connected"));
+        }
+        
         let list_to_send = if let Some(targets) = target_recipients { self.recipients.iter().filter(|r| targets.contains(r)).cloned().collect::<Vec<_>>() } else { self.recipients.clone() };
         for recipient in &list_to_send {
             let jid: Jid = format!("{}@s.whatsapp.net", recipient).parse().map_err(|e| anyhow::anyhow!("Invalid JID: {}", e))?;
