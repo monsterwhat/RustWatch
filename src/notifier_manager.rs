@@ -89,7 +89,9 @@ impl NotifierManager {
                                 lock.name.clone()
                             };
                             println!("WhatsApp notifier initialized.");
-                            let _ = n.send_startup_message(&name).await;
+                                                        if let Err(e) = n.send_startup_message(&name).await {
+                                eprintln!("Failed to send startup message: {}", e);
+                            }
                             self.whatsapp_started = true;
                         }
                         list.push(n.clone());

@@ -29,28 +29,21 @@ impl WhatsAppNotifier {
         self.connected.load(Ordering::SeqCst)
     }
     
-    pub async fn wait_for_ready(&self) -> Result<()> {
-        if self.connected.load(Ordering::SeqCst) {
-            return Ok(());
-        }
-        
-        // Wait up to 10 seconds for connection
-        for _ in 0..20 {
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            if self.connected.load(Ordering::SeqCst) {
-                return Ok(());
-            }
-        }
-        Err(anyhow::anyhow!("WhatsApp not ready"))
-    }
-    
     pub async fn send_startup_message(&self, name: &str) -> Result<()> {
         if !self.connected.load(Ordering::SeqCst) {
             return Err(anyhow::anyhow!("WhatsApp not connected"));
         }
         
-        // Wait a moment for any pending sync
-        tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+        // Wait for device sync to complete
+        for _ in 0..20 {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            if self.connected.load(Ordering::SeqCst) {
+                break;
+            }
+        }
+        
+        // Additional buffer for encryption keys to stabilize
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
         
         for recipient in &self.recipients {
             let jid: Jid = format!("{}@s.whatsapp.net", recipient).parse()?;
@@ -76,6 +69,12 @@ async fn send_robust(client: Arc<Client>, jid: Jid, text: String) -> Result<()> 
     }
     client.send_message(jid, msg).await?;
     Ok(())
+}
+
+async fn send_with_log(client: Arc<Client>, jid: Jid, text: String) {
+    if let Err(e) = send_robust(client, jid, text).await {
+        eprintln!("Failed to send WhatsApp message: {}", e);
+    }
 }
 
 impl WhatsAppNotifier {
@@ -134,10 +133,12 @@ impl WhatsAppNotifier {
                         }
                         Event::LoggedOut(_) => {
                             println!("🔴 WhatsApp session logged out! Please re-authenticate.");
+                            connected_inner.store(false, Ordering::SeqCst);
                             ready_flag_inner.store(false, Ordering::Relaxed);
                         }
                         Event::StreamReplaced(_) => {
                             println!("⚠️ WhatsApp session replaced (another device logged in)");
+                            connected_inner.store(false, Ordering::SeqCst);
                             ready_flag_inner.store(false, Ordering::Relaxed);
                         }
                         Event::Message(message, info) => {
@@ -160,8 +161,21 @@ impl WhatsAppNotifier {
                                     let state = state.clone();
                                     let notify = notify.clone();
                                     let client = client.clone();
+                                    let connected_inner = connected_inner.clone();
 
                                     tokio::spawn(async move {
+                                        // Wait for connection to be ready
+                                        for _ in 0..10 {
+                                            if connected_inner.load(Ordering::SeqCst) {
+                                                break;
+                                            }
+                                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                                        }
+                                        
+                                        if !connected_inner.load(Ordering::SeqCst) {
+                                            eprintln!("Cannot reply: WhatsApp not connected");
+                                            return;
+                                        }
                                         let reply_jid: Jid = match format!("{}@s.whatsapp.net", recipient_id).parse() {
                                             Ok(j) => j,
                                             Err(_) => return,
@@ -176,7 +190,7 @@ impl WhatsAppNotifier {
                                                 storage::save(&lock);
                                             }
                                             notify.notify_one();
-                                            let _ = send_robust(client, reply_jid, format!("✅ Added site: {}", url)).await;
+                                            send_with_log(client, reply_jid, format!("✅ Added site: {}", url)).await;
                                         } else if text.to_lowercase().starts_with("rm ") || text.to_lowercase().starts_with("remove ") {
                                             let url_part = if text.to_lowercase().starts_with("rm ") { text[3..].trim().to_string() } else { text[7..].trim().to_string() };
                                             let mut removed_url = String::new();
@@ -186,7 +200,7 @@ impl WhatsAppNotifier {
                                                 lock.sites.retain(|s| !s.url.contains(&url_part));
                                                 if lock.sites.len() < old_len { storage::save(&lock); removed_url = url_part; }
                                             }
-                                            if !removed_url.is_empty() { notify.notify_one(); let _ = send_robust(client, reply_jid, format!("✅ Removed site: {}", removed_url)).await; }
+                                            if !removed_url.is_empty() { notify.notify_one(); send_with_log(client, reply_jid, format!("✅ Removed site: {}", removed_url)).await; }
                                         } else if text.to_lowercase().starts_with("site frequency ") {
                                             let parts: Vec<String> = text.split_whitespace().map(|s| s.to_string()).collect();
                                             if parts.len() >= 4 {
@@ -201,7 +215,7 @@ impl WhatsAppNotifier {
                                                             storage::save(&lock);
                                                         }
                                                     }
-                                                    if !site_url.is_empty() { let _ = send_robust(client, reply_jid, format!("✅ Freq for {} set to every {} cycles", site_url, f)).await; }
+                                                    if !site_url.is_empty() { send_with_log(client, reply_jid, format!("✅ Freq for {} set to every {} cycles", site_url, f)).await; }
                                                 }
                                             }
                                         } else if text.to_lowercase().starts_with("setup retries ") {
@@ -211,7 +225,7 @@ impl WhatsAppNotifier {
                                                     lock.max_retries = n;
                                                     storage::save(&lock);
                                                 }
-                                                let _ = send_robust(client, reply_jid, format!("✅ Max retries set to {}", n)).await;
+                                                send_with_log(client, reply_jid, format!("✅ Max retries set to {}", n)).await;
                                             }
                                         } else if text.to_lowercase().starts_with("site recipient ") {
                                             let parts: Vec<String> = text.split_whitespace().map(|s| s.to_string()).collect();
@@ -227,7 +241,7 @@ impl WhatsAppNotifier {
                                                         site_url = s.url.clone(); storage::save(&lock);
                                                     }
                                                 }
-                                                if !site_url.is_empty() { let _ = send_robust(client, reply_jid, format!("✅ Updated recipients for {}", site_url)).await; }
+                                                if !site_url.is_empty() { send_with_log(client, reply_jid, format!("✅ Updated recipients for {}", site_url)).await; }
                                             }
                                         } else if text.to_lowercase().starts_with("pause ") {
                                             let url_part = text[6..].trim().to_string();
@@ -238,7 +252,7 @@ impl WhatsAppNotifier {
                                                     s.paused = true; site_url = s.url.clone(); storage::save(&lock);
                                                 }
                                             }
-                                            if !site_url.is_empty() { let _ = send_robust(client, reply_jid, format!("⏸ Paused: {}", site_url)).await; }
+                                            if !site_url.is_empty() { send_with_log(client, reply_jid, format!("⏸ Paused: {}", site_url)).await; }
                                         } else if text.to_lowercase().starts_with("resume ") {
                                             let url_part = text[7..].trim().to_string();
                                             let mut site_url = String::new();
@@ -248,7 +262,7 @@ impl WhatsAppNotifier {
                                                     s.paused = false; site_url = s.url.clone(); storage::save(&lock);
                                                 }
                                             }
-                                            if !site_url.is_empty() { let _ = send_robust(client, reply_jid, format!("▶ Resumed: {}", site_url)).await; }
+                                            if !site_url.is_empty() { send_with_log(client, reply_jid, format!("▶ Resumed: {}", site_url)).await; }
                                         } else if text.to_lowercase().starts_with("silence ") {
                                             if let Ok(m) = text[8..].trim().parse::<i64>() {
                                                 {
@@ -256,10 +270,10 @@ impl WhatsAppNotifier {
                                                     lock.silence_until = Some(Utc::now() + Duration::minutes(m));
                                                     storage::save(&lock);
                                                 }
-                                                let _ = send_robust(client, reply_jid, format!("🔇 Silenced for {}m", m)).await;
+                                                send_with_log(client, reply_jid, format!("🔇 Silenced for {}m", m)).await;
                                             }
                                         } else if text.to_lowercase() == "stats" {
-                                            let _ = send_robust(client, reply_jid, stats::get_report()).await;
+                                            send_with_log(client, reply_jid, stats::get_report()).await;
                                         } else if text.to_lowercase() == "list" {
                                             let sites_list = {
                                                 let lock = state.read().unwrap();
@@ -272,10 +286,10 @@ impl WhatsAppNotifier {
                                                     }).collect::<Vec<_>>().join("\n")
                                                 }
                                             };
-                                            let _ = send_robust(client, reply_jid, format!("📋 Sites:\n{}", sites_list)).await;
+                                            send_with_log(client, reply_jid, format!("📋 Sites:\n{}", sites_list)).await;
                                         } else if text.to_lowercase() == "shutdown" || text.to_lowercase() == "quit" || text.to_lowercase() == "exit" {
                                             let name = { state.read().unwrap().name.clone() };
-                                            let _ = send_robust(client, reply_jid, format!("🛑 Shutting down {}...", name)).await;
+                                            send_with_log(client, reply_jid, format!("🛑 Shutting down {}...", name)).await;
                                             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                                             std::process::exit(0);
                                         } else if text.to_lowercase().starts_with("recipient ") {
@@ -286,15 +300,15 @@ impl WhatsAppNotifier {
                                                     let mut lock = state.write().unwrap();
                                                     if !lock.whatsapp.recipients.contains(&phone) { lock.whatsapp.recipients.push(phone.clone()); storage::save(&lock); true } else { false }
                                                 };
-                                                if added { notify.notify_one(); let _ = send_robust(client, reply_jid, format!("✅ Added recipient: {}", phone)).await; }
+                                                if added { notify.notify_one(); send_with_log(client, reply_jid, format!("✅ Added recipient: {}", phone)).await; }
                                             } else if parts.len() >= 3 && parts[1] == "rm" {
                                                 let phone = parts[2].clone();
                                                 { let mut lock = state.write().unwrap(); lock.whatsapp.recipients.retain(|r| r != &phone); storage::save(&lock); }
                                                 notify.notify_one();
-                                                let _ = send_robust(client, reply_jid, format!("✅ Removed recipient: {}", phone)).await;
+                                                send_with_log(client, reply_jid, format!("✅ Removed recipient: {}", phone)).await;
                                             } else if parts.len() >= 2 && parts[1] == "list" {
                                                 let recipients_list = { state.read().unwrap().whatsapp.recipients.iter().map(|r| format!("- {}", r)).collect::<Vec<_>>().join("\n") };
-                                                let _ = send_robust(client, reply_jid, format!("📋 Authorized Recipients:\n{}", recipients_list)).await;
+                                                send_with_log(client, reply_jid, format!("📋 Authorized Recipients:\n{}", recipients_list)).await;
                                             }
                                         } else if text.to_lowercase() == "help" {
                                             let name = { state.read().unwrap().name.clone() };
@@ -302,7 +316,7 @@ impl WhatsAppNotifier {
                                                 "🤖 {} Commands:\n- stats: Session report\n- setup retries <n>: Failure threshold\n- site frequency <url> <n>: n checks per interval\n- pause/resume <url>: Mute site\n- silence <min>: Global mute\n- site recipient add/rm <url> <num>: Targeted alerts\n- add <url>: Add site\n- list: Show all\n- help: Commands",
                                                 name
                                             );
-                                            let _ = send_robust(client, reply_jid, msg).await;
+                                            send_with_log(client, reply_jid, msg).await;
                                         }
                                     });
                                 }
@@ -316,7 +330,6 @@ impl WhatsAppNotifier {
             .await?;
 
         let client = bot.client();
-        let connected = Arc::new(AtomicBool::new(false));
         let connected_for_reconnect = connected.clone();
         let ready_flag_for_reconnect = ready_flag.clone();
         
@@ -330,6 +343,7 @@ impl WhatsAppNotifier {
                     loop {
                         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                         if ready_flag_for_reconnect.load(Ordering::Relaxed) {
+                            connected_for_reconnect.store(true, Ordering::SeqCst);
                             println!("✓ WhatsApp reconnected and synced!");
                             break;
                         }

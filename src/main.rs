@@ -55,7 +55,9 @@ async fn monitor_loop(state: Arc<RwLock<app_state::AppState>>, notify: Arc<Notif
 
                 if first_run && !notifiers.is_empty() {
                     for notifier in &notifiers {
-                        let _ = notifier.send(&format!("🚀 {} started.", snapshot.name), None).await;
+                        if let Err(e) = notifier.send(&format!("🚀 {} started.", snapshot.name), None).await {
+                            eprintln!("Failed to send startup notification: {}", e);
+                        }
                     }
                     first_run = false;
                 }
@@ -108,7 +110,11 @@ async fn monitor_loop(state: Arc<RwLock<app_state::AppState>>, notify: Arc<Notif
                         if should_notify && !is_silenced {
                             if let Some(msg) = tracker.get_last_message(&site_copy.url) {
                                 let targets = site_copy.recipients.as_deref();
-                                for notifier in &notifiers { let _ = notifier.send(&msg, targets).await; }
+                                for notifier in &notifiers {
+                                    if let Err(e) = notifier.send(&msg, targets).await {
+                                        eprintln!("Failed to send notification: {}", e);
+                                    }
+                                }
                             }
                         }
 
